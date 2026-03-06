@@ -1,2 +1,7 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Normalize line endings for all text files
+* text=auto eol=lf
+
+# Exclude these files/folders from the ZIP downloaded by the asset library
+screenshots/ export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore
