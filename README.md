@@ -2,11 +2,11 @@
 
 # 
 
-# > \*\*Create beautiful game environments directly inside Godot.\*\*
+# Create beautiful game environments directly inside Godot.
 
-# >
+# 
 
-# > Asset Browser combines a powerful asset browser with a professional environment painting system. Browse your `.tscn` assets, paint them directly onto surfaces, generate forests, scatter props, create paths, and build entire environments without leaving the editor.
+# Asset Browser combines a Blender-style asset browser with a professional environment painting system. Browse `.tscn` assets, paint them directly onto surfaces, scatter props, create forests, draw paths, and build entire environments without ever leaving the editor.
 
 # 
 
@@ -18,49 +18,35 @@
 
 # 
 
-# \# Features
+# \## Features
 
 # 
 
-# \## 📁 Asset Browser
+# \### Asset Browser
 
 # 
 
-# \- Browse any folder of `.tscn` assets
+# \- Browse folders of `.tscn` assets
 
 # \- Thumbnail previews
 
-# \- Live search
+# \- Search assets instantly
 
 # \- Favorites
 
 # \- Recently used assets
 
-# \- Custom asset collections
-
-# \- Asset tags
+# \- Custom collections
 
 # \- Adjustable thumbnail sizes
 
-# \- Drag-and-drop placement into 2D and 3D
+# \- Drag-and-drop placement
 
 # \- Persistent browser settings
 
 # 
 
-# \---
-
-# 
-
-# \# 🌿 Environment Painter
-
-# 
-
-# Paint assets directly onto meshes in the 3D editor.
-
-# 
-
-# Features include:
+# \### Environment Painting
 
 # 
 
@@ -80,27 +66,7 @@
 
 # 
 
-# Supports:
-
-# 
-
-# \- Scene Instances
-
-# \- MultiMesh
-
-# \- Undo / Redo
-
-# 
-
-# \---
-
-# 
-
-# \# 🖌 Brush Controls
-
-# 
-
-# Quick access controls:
+# \### Brush Controls
 
 # 
 
@@ -112,31 +78,19 @@
 
 # \- Spacing
 
-# \- Alignment
-
-# \- Surface Offset
-
 # \- Rotation
 
 # \- Scale
+
+# \- Alignment
+
+# \- Surface Offset
 
 # \- Surface Filters
 
 # 
 
-# Context-sensitive controls automatically appear depending on the active brush.
-
-# 
-
-# \---
-
-# 
-
-# \# 🌲 Scatter System
-
-# 
-
-# Multiple distribution modes:
+# \### Scatter
 
 # 
 
@@ -150,51 +104,23 @@
 
 # \- Edge Bias
 
-# 
-
-# Additional controls:
-
-# 
-
 # \- Brush Falloff
 
-# \- Per-asset spacing
+# \- Random Seed
 
-# \- Random seed
-
-# \- Deterministic placement
+# \- Weighted Variants
 
 # 
 
-# \---
+# \### Surface Painting
 
 # 
 
-# \# 🌳 Surface Painting
-
-# 
-
-# Paint directly onto:
-
-# 
-
-# \- MeshInstance3D
-
-# \- Terrain
-
-# \- Static geometry
-
-# \- Sloped surfaces
-
-# 
-
-# Supports:
-
-# 
+# \- Paint directly onto meshes
 
 # \- Surface alignment
 
-# \- Keep Upright
+# \- Keep upright mode
 
 # \- Blend alignment
 
@@ -202,53 +128,13 @@
 
 # 
 
-# \---
+# \### MultiMesh
 
 # 
 
-# \# 🌄 Surface Filters
-
-# 
-
-# Filter placement using:
-
-# 
-
-# \- Minimum slope
-
-# \- Maximum slope
-
-# \- Minimum height
-
-# \- Maximum height
-
-# \- Layer mask
-
-# \- Selected surface only
-
-# 
-
-# \---
-
-# 
-
-# \# 🌿 MultiMesh Support
-
-# 
-
-# Paint directly into MultiMeshes for extremely large environments.
-
-# 
-
-# Features:
-
-# 
+# \- Paint directly into MultiMeshes
 
 # \- Automatic mesh extraction
-
-# \- Material preservation
-
-# \- Random transforms
 
 # \- Chunked MultiMeshes
 
@@ -258,119 +144,11 @@
 
 # 
 
-# \---
+# \### Ecosystems
 
 # 
 
-# \# 🌲 Weighted Variants
-
-# 
-
-# Paint naturally varied environments.
-
-# 
-
-# Choose multiple assets and assign custom weights.
-
-# 
-
-# Example:
-
-# 
-
-# ```
-
-# Pine Tree       60%
-
-# 
-
-# Oak Tree        30%
-
-# 
-
-# Dead Tree       10%
-
-# ```
-
-# 
-
-# Each asset can have:
-
-# 
-
-# \- Custom weight
-
-# \- Custom spacing
-
-# \- Enable/disable
-
-# \- Ecosystem category
-
-# 
-
-# \---
-
-# 
-
-# \# 🌎 Ecosystem Brushes
-
-# 
-
-# Create reusable ecosystem brushes.
-
-# 
-
-# Example:
-
-# 
-
-# ```
-
-# Forest
-
-# 
-
-# Trees
-
-# &#x20;   Pine
-
-# &#x20;   Oak
-
-# &#x20;   Dead Tree
-
-# 
-
-# Ground Cover
-
-# &#x20;   Grass
-
-# &#x20;   Flowers
-
-# 
-
-# Details
-
-# &#x20;   Rocks
-
-# &#x20;   Mushrooms
-
-# ```
-
-# 
-
-# Paint an entire ecosystem with one brush.
-
-# 
-
-# \---
-
-# 
-
-# \# ✏ Surface Path Brush
-
-# 
-
-# Draw paths directly on terrain.
+# Create reusable ecosystem brushes with weighted asset placement.
 
 # 
 
@@ -378,17 +156,25 @@
 
 # 
 
-# \- Fence lines
+# \- Forests
 
-# \- Tree lines
+# \- Rocks
 
-# \- Roads
+# \- Flowers
+
+# \- Grass
 
 # \- Bushes
 
-# \- Street lights
+# \- Debris
 
-# \- Rivers
+# 
+
+# \### Surface Path Brush
+
+# 
+
+# Draw editable paths directly onto geometry.
 
 # 
 
@@ -406,85 +192,33 @@
 
 # 
 
-# Generated paths remain editable and automatically regenerate their contents.
+# \### Area Tools
 
 # 
 
-# \---
+# \- Rectangle Scatter
+
+# \- Lasso Scatter
+
+# \- Fill Selected Mesh
+
+# \- Scatter Inside Area3D
+
+# \- Clear Area3D
 
 # 
 
-# \# 📐 Area Tools
+# \### Brush Presets
 
 # 
 
-# Rectangle Scatter
+# Save and load complete brush configurations including:
 
 # 
 
-# Lasso Scatter
+# \- Assets
 
-# 
-
-# Fill Selected Mesh
-
-# 
-
-# Scatter Inside Area3D
-
-# 
-
-# Clear Area3D
-
-# 
-
-# \---
-
-# 
-
-# \# ♻ Reapply Brush
-
-# 
-
-# Modify existing painted assets without repainting.
-
-# 
-
-# Update only:
-
-# 
-
-# \- Rotation
-
-# \- Scale
-
-# \- Alignment
-
-# \- Offset
-
-# \- Asset Variant
-
-# 
-
-# \---
-
-# 
-
-# \# 💾 Brush Presets
-
-# 
-
-# Save every brush configuration.
-
-# 
-
-# Presets remember:
-
-# 
-
-# \- Selected assets
-
-# \- Brush settings
+# \- Scatter settings
 
 # \- Filters
 
@@ -492,27 +226,15 @@
 
 # \- Scale
 
-# \- Scatter settings
-
 # \- Ecosystem settings
 
-# \- Surface Path settings
+# 
+
+# \### Statistics
 
 # 
 
-# Export and import presets between projects.
-
-# 
-
-# \---
-
-# 
-
-# \# 📊 Statistics \& Analysis
-
-# 
-
-# Live statistics while painting:
+# Live editor statistics include:
 
 # 
 
@@ -520,35 +242,11 @@
 
 # \- MultiMeshes
 
-# \- Unique assets
+# \- Draw Calls
 
-# \- Estimated draw calls
+# \- Triangle Count
 
-# \- Estimated triangle count
-
-# \- Optimization rating
-
-# 
-
-# Analyze selected assets:
-
-# 
-
-# \- Mesh count
-
-# \- Triangle count
-
-# \- Materials
-
-# \- Collision
-
-# \- Scripts
-
-# \- Animation
-
-# \- Particles
-
-# \- MultiMesh compatibility
+# \- Optimization Rating
 
 # 
 
@@ -556,109 +254,31 @@
 
 # 
 
-# \# ⚡ Performance
+# \## Installation
 
 # 
 
-# Designed for extremely large scenes.
+# \### Via the Godot Asset Library (recommended)
 
 # 
 
-# Features include:
+# 1\. Open your project in Godot.
 
-# 
-
-# \- Spatial hash placement
-
-# \- Chunked MultiMeshes
-
-# \- Cached scene loading
-
-# \- Cached raycasting
-
-# \- Optimized spacing tests
-
-# \- Persistent editor settings
-
-# 
-
-# \---
-
-# 
-
-# \# ⌨ Hotkeys
-
-# 
-
-# | Shortcut | Action |
-
-# |-----------|--------|
-
-# | `\[` | Smaller Brush |
-
-# | `]` | Larger Brush |
-
-# | `Shift + \[` | Lower Density |
-
-# | `Shift + ]` | Increase Density |
-
-# | `Ctrl + \[` | Lower Count |
-
-# | `Ctrl + ]` | Increase Count |
-
-# | `Alt + \[` | Lower Spacing |
-
-# | `Alt + ]` | Increase Spacing |
-
-# | `Shift + Paint` | Temporary Erase |
-
-# | `Ctrl + Paint` | Precise Placement |
-
-# | `Esc` | Exit Painter |
-
-# 
-
-# \---
-
-# 
-
-# \# Installation
-
-# 
-
-# \## Godot Asset Library
-
-# 
-
-# 1\. Open your project.
-
-# 2\. Open \*\*AssetLib\*\*.
+# 2\. Open the \*\*AssetLib\*\* tab.
 
 # 3\. Search for \*\*Asset Browser\*\*.
 
-# 4\. Download and install.
+# 4\. Download the plugin.
 
-# 5\. Enable the plugin in:
-
-# 
-
-# ```
-
-# Project → Project Settings → Plugins
-
-# ```
+# 5\. Enable it under \*\*Project → Project Settings → Plugins\*\*.
 
 # 
 
-# \---
+# \### Manual
 
 # 
 
-# \## Manual Installation
-
-# 
-
-# 1\. Download this repository.
+# 1\. Download or clone this repository.
 
 # 2\. Copy:
 
@@ -672,19 +292,7 @@
 
 # 
 
-# into your project's:
-
-# 
-
-# ```
-
-# addons/
-
-# ```
-
-# 
-
-# folder.
+# into your project's `addons` folder.
 
 # 
 
@@ -696,13 +304,13 @@
 
 # 
 
-# \# Quick Start
+# \## Quick Start
 
 # 
 
 # 1\. Open the \*\*Assets\*\* dock.
 
-# 2\. Choose an asset folder.
+# 2\. Select your asset folder.
 
 # 3\. Select one or more assets.
 
@@ -720,53 +328,49 @@
 
 # 
 
-# \# Requirements
+# \## Hotkeys
+
+# 
+
+# | Shortcut | Action |
+
+# |----------|--------|
+
+# | `\[` `]` | Brush Size |
+
+# | `Shift + \[` `]` | Density |
+
+# | `Ctrl + \[` `]` | Count |
+
+# | `Alt + \[` `]` | Spacing |
+
+# | `Shift + Paint` | Temporary Erase |
+
+# | `Ctrl + Paint` | Precise Placement |
+
+# | `Esc` | Exit Painter |
+
+# 
+
+# \---
+
+# 
+
+# \## Requirements
 
 # 
 
 # \- Godot 4.7+
 
-# \- Windows, Linux, macOS
-
 # 
 
 # \---
 
 # 
 
-# \# Roadmap
+# \## License
 
 # 
 
-# Planned future improvements include:
-
-# 
-
-# \- Terrain texture mask painting
-
-# \- Vertex color painting
-
-# \- Biome generation
-
-# \- Procedural forest generation
-
-# \- Advanced scatter rules
-
-# \- World generation tools
-
-# 
-
-# \---
-
-# 
-
-# \# License
-
-# 
-
-# MIT License
-
-# 
-
-# See \[LICENSE](LICENSE).
+# MIT License — see \[LICENSE](LICENSE) for details.
 
