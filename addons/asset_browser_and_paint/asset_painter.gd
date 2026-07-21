@@ -1,6 +1,14 @@
 @tool
 extends Control
 
+const PainterGridMath = preload("res://addons/asset_browser/painter_grid_math.gd")
+const AssetAnalysis = preload("res://addons/asset_browser/asset_analysis.gd")
+const PainterGeometry = preload("res://addons/asset_browser/painter_geometry.gd")
+const PainterSampling = preload("res://addons/asset_browser/painter_sampling.gd")
+const PainterSpatialHash = preload("res://addons/asset_browser/painter_spatial_hash.gd")
+const PainterPreview = preload("res://addons/asset_browser/painter_preview.gd")
+const PainterMultiMesh = preload("res://addons/asset_browser/painter_multimesh.gd")
+
 signal active_changed(active: bool)
 
 var plugin: EditorPlugin
@@ -39,6 +47,23 @@ var minimum_height := -100000.0
 var maximum_height := 100000.0
 var surface_offset := 0.0
 var collision_layer_mask: int = 0xFFFFFFFF
+# Placement surface: 0 = Geometry, 1 = Geometry + Grid fallback, 2 = Grid only.
+var surface_mode: int = 1
+var grid_plane: int = 0 # 0 = XZ, 1 = XY, 2 = YZ
+var grid_offset: float = 0.0
+var grid_snap: float = 1.0
+# Grid snapping: 0 = fixed grid, 1 = selected asset bounds, 2 = custom per-axis.
+var grid_snap_mode: int = 0
+var grid_custom_snap: Vector3 = Vector3.ONE
+var grid_rotation_snap_enabled: bool = false
+var grid_rotation_snap_degrees: float = 90.0
+var grid_override_occupied: bool = false
+var _placing_on_grid: bool = false
+var _active_grid_cell: Vector3i = Vector3i.ZERO
+var _active_grid_step: Vector3 = Vector3.ONE
+var _active_grid_layer: String = ""
+var _asset_bounds_cache: Dictionary = {}
+var asset_placement_bounds: Dictionary = {}
 var random_seed: int = 0 # 0 = nondeterministic
 var distribution_mode: int = 0 # 0 uniform, 1 blue noise, 2 clustered, 3 center bias, 4 edge bias
 var brush_falloff: float = 0.0
@@ -55,6 +80,13 @@ var multimesh_visibility_begin: float = 0.0
 var multimesh_visibility_end: float = 0.0
 var _spacing_hash: Dictionary = {}
 var _spacing_hash_dirty: bool = true
+# Cached visible-mesh raycast data. The fallback raycaster used to rediscover every
+# MeshInstance3D and rebuild every surface array for every brush sample.
+var _visible_mesh_nodes_cache: Array[MeshInstance3D] = []
+var _mesh_surface_cache: Dictionary = {}
+var _visible_mesh_cache_dirty: bool = true
+var _visible_mesh_cache_elapsed: float = 0.0
+const VISIBLE_MESH_CACHE_REFRESH_SECONDS := 1.0
 
 var _status_text := "Choose a Node3D parent"
 var _last_hit: Dictionary = {}
@@ -73,6 +105,7 @@ var _multimesh_before_snapshot: Array = []
 var _multimesh_stroke_active := false
 var _scene_before_snapshot: Array = []
 var _scene_reapply_active := false
+var _scene_grid_override_active := false
 var _preview_points: Array[Vector3] = []
 var _surface_valid := false
 var _surface_feedback := "Move the brush over a surface"
@@ -101,6 +134,7 @@ var path_create_node: bool = true
 var path_auto_scatter: bool = true
 var path_live_update: bool = true
 var path_update_delay: float = 0.25
+var path_max_placements: int = 500
 var _path_entries_override: Array[Dictionary] = []
 var _path_regen_tokens: Dictionary = {}
 var _path_regenerating: bool = false
@@ -122,6 +156,8 @@ func set_active(value: bool) -> void:
 	active = value
 	visible = value
 	_raycast_dirty = true
+	_visible_mesh_cache_dirty = true
+	_visible_mesh_cache_elapsed = VISIBLE_MESH_CACHE_REFRESH_SECONDS
 	if value:
 		_refresh_painted_nodes()
 	_spacing_hash_dirty = true
@@ -203,6 +239,7 @@ func set_option(option_name: String, value: Variant) -> void:
 		"path_auto_scatter": path_auto_scatter = bool(value)
 		"path_live_update": path_live_update = bool(value)
 		"path_update_delay": path_update_delay = clampf(float(value), 0.05, 2.0)
+		"path_max_placements": path_max_placements = clampi(int(value), 1, 10000)
 		"random_seed":
 			random_seed = maxi(0, int(value))
 			if random_seed == 0:
@@ -210,6 +247,20 @@ func set_option(option_name: String, value: Variant) -> void:
 			else:
 				_rng.seed = random_seed
 			_stroke_sequence = 0
+		"surface_mode": surface_mode = clampi(int(value), 0, 2)
+		"grid_plane": grid_plane = clampi(int(value), 0, 2)
+		"grid_offset": grid_offset = float(value)
+		"grid_snap": grid_snap = maxf(0.0, float(value))
+		"grid_snap_mode": grid_snap_mode = clampi(int(value), 0, 2)
+		"grid_custom_snap_x": grid_custom_snap.x = maxf(0.0, float(value))
+		"grid_custom_snap_y": grid_custom_snap.y = maxf(0.0, float(value))
+		"grid_custom_snap_z": grid_custom_snap.z = maxf(0.0, float(value))
+		"grid_rotation_snap_enabled": grid_rotation_snap_enabled = bool(value)
+		"grid_rotation_snap_degrees": grid_rotation_snap_degrees = clampf(float(value), 1.0, 180.0)
+		"grid_override_occupied": grid_override_occupied = bool(value)
+		"asset_placement_bounds":
+			asset_placement_bounds = (value as Dictionary).duplicate(true) if value is Dictionary else {}
+			_asset_bounds_cache.clear()
 		"collision_layer_mask":
 			if value == null:
 				collision_layer_mask = 0xFFFFFFFF
@@ -237,18 +288,19 @@ func _update_status() -> void:
 		parent_name = str(placement_parent.name)
 	var selected_count: int = 0
 	if panel != null and panel.has_method("get_selected_scene_paths"):
-		selected_count = (panel.get_selected_scene_paths() as Array).size()
+		selected_count = (panel.call("get_selected_scene_paths") as Array).size()
 	var mode_text := "MultiMesh" if placement_mode == 1 else "Scene"
 	var tool_text := "Surface Path" if area_tool_mode == 3 else ("Rectangle" if area_tool_mode == 1 else ("Lasso" if area_tool_mode == 2 else ("Reapply" if reapply_mode else ("Erase" if erase_mode else "Paint"))))
 	_status_text = "%s | %s | Assets: %d | Parent: %s | Radius: %.2f | Count: %d | Density: %.2f | Spacing: %.2f | %s" % [tool_text, mode_text, selected_count, parent_name, brush_radius, count_per_click, drag_density, minimum_spacing, _surface_feedback]
 	if placement_parent == null or not is_instance_valid(placement_parent):
-		_status_text += " | Select a Node3D and click Use Selected Parent"
+		_status_text += " | Select a Node3D and click Select Parent"
 	if panel != null and panel.has_method("set_painter_status"):
 		panel.set_painter_status(_status_text)
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if not active:
 		return
+	_visible_mesh_cache_elapsed += delta
 	_update_status()
 	if _raycast_dirty and _viewport_camera != null and is_instance_valid(_viewport_camera):
 		_last_hit = _raycast_scene(_mouse_position, _viewport_camera)
@@ -260,58 +312,12 @@ func _process(_delta: float) -> void:
 func _draw() -> void:
 	_draw_area_selection()
 	_draw_surface_path_preview()
-	if area_tool_mode == 3:
+	if area_tool_mode == 3 or not active or _last_hit.is_empty() or _viewport_camera == null:
 		return
-	if not active or _last_hit.is_empty() or _viewport_camera == null:
-		return
-	var hit_position: Vector3 = _last_hit["position"] as Vector3
-	var hit_normal: Vector3 = (_last_hit["normal"] as Vector3).normalized()
-	if _viewport_camera.is_position_behind(hit_position):
-		return
-	var center: Vector2 = _viewport_camera.unproject_position(hit_position)
-	var edge_world: Vector3 = hit_position + _surface_right(hit_normal) * brush_radius
-	var edge: Vector2 = _viewport_camera.unproject_position(edge_world)
-	var radius_px: float = maxf(4.0, center.distance_to(edge))
-	var brush_color := Color(0.25, 0.75, 1.0, 0.95)
-	if reapply_mode:
-		brush_color = Color(0.75, 0.35, 1.0, 0.95)
-	elif erase_mode:
-		brush_color = Color(1.0, 0.25, 0.25, 0.95)
-	elif not _surface_valid:
-		brush_color = Color(1.0, 0.55, 0.15, 0.95)
-	draw_circle(center, radius_px, Color(brush_color.r, brush_color.g, brush_color.b, 0.08))
-	draw_arc(center, radius_px, 0.0, TAU, 72, brush_color, 2.5, true)
-	draw_arc(center, radius_px * 0.5, 0.0, TAU, 48, Color(brush_color.r, brush_color.g, brush_color.b, 0.45), 1.0, true)
-	draw_circle(center, 4.0, brush_color)
-	var normal_end_world: Vector3 = hit_position + hit_normal * maxf(0.5, brush_radius * 0.35)
-	if not _viewport_camera.is_position_behind(normal_end_world):
-		var normal_end: Vector2 = _viewport_camera.unproject_position(normal_end_world)
-		draw_line(center, normal_end, brush_color, 2.0, true)
-		var direction: Vector2 = (normal_end - center).normalized()
-		var side := Vector2(-direction.y, direction.x)
-		draw_colored_polygon(PackedVector2Array([normal_end, normal_end - direction * 9.0 + side * 4.0, normal_end - direction * 9.0 - side * 4.0]), brush_color)
-	for point in _preview_points:
-		if _viewport_camera.is_position_behind(point):
-			continue
-		var screen_point: Vector2 = _viewport_camera.unproject_position(point)
-		var marker_color := Color(brush_color.r, brush_color.g, brush_color.b, 0.78)
-		draw_circle(screen_point, 5.0, Color(marker_color.r, marker_color.g, marker_color.b, 0.20))
-		draw_arc(screen_point, 5.0, 0.0, TAU, 16, marker_color, 1.5, true)
-		draw_line(screen_point + Vector2(-3.0, 0.0), screen_point + Vector2(3.0, 0.0), marker_color, 1.0, true)
-		draw_line(screen_point + Vector2(0.0, -3.0), screen_point + Vector2(0.0, 3.0), marker_color, 1.0, true)
+	PainterPreview.draw_brush(self, _viewport_camera, _last_hit, _preview_points, brush_radius, _surface_valid, erase_mode, reapply_mode)
 
 func _draw_area_selection() -> void:
-	if not active or not _area_dragging:
-		return
-	var color := Color(0.35, 0.9, 0.55, 0.95)
-	if area_tool_mode == 1:
-		var rect := Rect2(_area_start, _area_current - _area_start).abs()
-		draw_rect(rect, Color(color.r, color.g, color.b, 0.09), true)
-		draw_rect(rect, color, false, 2.0)
-	elif area_tool_mode == 2 and _lasso_points.size() > 1:
-		draw_polyline(_lasso_points, color, 2.0, true)
-		if _lasso_points.size() > 2:
-			draw_line(_lasso_points[_lasso_points.size() - 1], _lasso_points[0], Color(color.r, color.g, color.b, 0.5), 1.0, true)
+	PainterPreview.draw_area_selection(self, active, _area_dragging, area_tool_mode, _area_start, _area_current, _lasso_points)
 
 func _update_preview_state() -> void:
 	_preview_points.clear()
@@ -324,35 +330,12 @@ func _update_preview_state() -> void:
 	_surface_valid = _surface_feedback.is_empty()
 	if _surface_valid:
 		_surface_feedback = "Reapply ready" if reapply_mode else ("Erase ready" if erase_mode else "Ready")
-	var center_position: Vector3 = _last_hit["position"] as Vector3
-	var normal: Vector3 = (_last_hit["normal"] as Vector3).normalized()
 	if erase_mode or reapply_mode:
 		_update_status()
 		return
-	var preview_count: int = clampi(count_per_click, 1, 32)
-	var right: Vector3 = _surface_right(normal)
-	var forward: Vector3 = normal.cross(right).normalized()
-	var preview_rng := RandomNumberGenerator.new()
-	preview_rng.seed = 912367 + random_seed + preview_count * 31 + distribution_mode * 997
-	for i in preview_count:
-		var angle: float = preview_rng.randf_range(0.0, TAU)
-		var radius_fraction: float = sqrt(preview_rng.randf())
-		match distribution_mode:
-			2:
-				var clusters: int = maxi(1, mini(cluster_count, preview_count))
-				var cluster_angle: float = TAU * float(i % clusters) / float(clusters)
-				var cluster_center := Vector2(cos(cluster_angle), sin(cluster_angle)) * brush_radius * 0.45
-				var jitter := Vector2(cos(angle), sin(angle)) * brush_radius * lerpf(0.32, 0.05, cluster_strength) * radius_fraction
-				var offset: Vector2 = (cluster_center + jitter).limit_length(brush_radius * 0.9)
-				_preview_points.append(center_position + right * offset.x + forward * offset.y + normal * surface_offset)
-			3:
-				radius_fraction = pow(preview_rng.randf(), 1.0 + maxf(0.25, brush_falloff) * 3.0)
-				_preview_points.append(center_position + right * cos(angle) * radius_fraction * brush_radius * 0.9 + forward * sin(angle) * radius_fraction * brush_radius * 0.9 + normal * surface_offset)
-			4:
-				radius_fraction = 1.0 - pow(preview_rng.randf(), 1.0 + maxf(0.25, brush_falloff) * 3.0)
-				_preview_points.append(center_position + right * cos(angle) * radius_fraction * brush_radius * 0.9 + forward * sin(angle) * radius_fraction * brush_radius * 0.9 + normal * surface_offset)
-			_:
-				_preview_points.append(center_position + right * cos(angle) * radius_fraction * brush_radius * 0.9 + forward * sin(angle) * radius_fraction * brush_radius * 0.9 + normal * surface_offset)
+	var center_position: Vector3 = _last_hit["position"] as Vector3
+	var normal: Vector3 = (_last_hit["normal"] as Vector3).normalized()
+	_preview_points = PainterPreview.build_preview_points(center_position, normal, brush_radius, count_per_click, distribution_mode, cluster_count, cluster_strength, brush_falloff, surface_offset, random_seed)
 	_update_status()
 
 func _get_filter_rejection_reason(hit: Dictionary) -> String:
@@ -469,12 +452,17 @@ func handle_viewport_input(camera: Camera3D, event: InputEvent) -> bool:
 				elif reapply_mode:
 					_scene_before_snapshot = _capture_scene_snapshot()
 					_scene_reapply_active = true
+				elif grid_override_occupied and surface_mode != 0:
+					_scene_before_snapshot = _capture_scene_snapshot()
+					_scene_grid_override_active = true
 				_paint_at(event.position, camera, event.shift_pressed, event.ctrl_pressed)
 			else:
 				if placement_mode == 1:
 					_commit_multimesh_stroke("Reapply MultiMesh Assets" if reapply_mode else ("Erase MultiMesh Assets" if erase_mode else "Paint MultiMesh Assets"))
 				elif reapply_mode:
 					_commit_scene_reapply()
+				elif _scene_grid_override_active:
+					_commit_scene_grid_override()
 				else:
 					_commit_stroke()
 			return true
@@ -502,10 +490,15 @@ func _begin_bulk_operation() -> void:
 	if placement_mode == 1:
 		_multimesh_before_snapshot = _capture_multimesh_snapshot()
 		_multimesh_stroke_active = true
+	elif grid_override_occupied and surface_mode != 0:
+		_scene_before_snapshot = _capture_scene_snapshot()
+		_scene_grid_override_active = true
 
 func _finish_bulk_operation(action_name: String) -> void:
 	if placement_mode == 1:
 		_commit_multimesh_stroke(action_name)
+	elif _scene_grid_override_active:
+		_commit_scene_grid_override()
 	else:
 		_commit_stroke()
 	_refresh_painted_nodes()
@@ -567,6 +560,9 @@ func _execute_screen_area(camera: Camera3D) -> void:
 	var bounds := _lasso_bounds() if area_tool_mode == 2 else Rect2(_area_start, _area_current - _area_start).abs()
 	if bounds.size.x < 3.0 or bounds.size.y < 3.0:
 		return
+	if surface_mode == 2:
+		_execute_grid_area_fill(camera, bounds)
+		return
 	_begin_bulk_operation()
 	var placed := 0
 	var target := _area_target_count()
@@ -590,6 +586,215 @@ func _execute_screen_area(camera: Camera3D) -> void:
 	if placed < target:
 		_surface_feedback += " (spacing or surface filters prevented the rest)"
 	_update_status()
+
+func _execute_grid_area_fill(camera: Camera3D, screen_bounds: Rect2) -> void:
+	var entries := _current_weighted_entries()
+	if entries.is_empty():
+		_surface_feedback = "Select one or more assets before filling grid cells"
+		_update_status()
+		return
+	var step := _grid_cell_size()
+	var plane_step := _grid_plane_step(step)
+	if plane_step.x <= 0.00001 or plane_step.y <= 0.00001:
+		_surface_feedback = "Grid snap size must be greater than zero"
+		_update_status()
+		return
+	var world_points: Array[Vector3] = []
+	var screen_points: PackedVector2Array = _lasso_points if area_tool_mode == 2 else PackedVector2Array([
+		screen_bounds.position,
+		Vector2(screen_bounds.end.x, screen_bounds.position.y),
+		screen_bounds.end,
+		Vector2(screen_bounds.position.x, screen_bounds.end.y)
+	])
+	for screen_point in screen_points:
+		var origin := camera.project_ray_origin(screen_point)
+		var direction := camera.project_ray_normal(screen_point).normalized()
+		var hit := _raycast_grid_plane(origin, direction)
+		if not hit.is_empty():
+			world_points.append(hit["position"] as Vector3)
+	if world_points.is_empty():
+		return
+
+	var first_cell := _world_to_grid_cell(world_points[0], step)
+	var min_a := _grid_cell_axis_a(first_cell)
+	var max_a := min_a
+	var min_b := _grid_cell_axis_b(first_cell)
+	var max_b := min_b
+	for point in world_points:
+		var cell := _world_to_grid_cell(point, step)
+		var a := _grid_cell_axis_a(cell)
+		var b := _grid_cell_axis_b(cell)
+		min_a = mini(min_a, a)
+		max_a = maxi(max_a, a)
+		min_b = mini(min_b, b)
+		max_b = maxi(max_b, b)
+
+	_begin_bulk_operation()
+	var placed := 0
+	var visited := 0
+	var safety_limit := maxi(1, area_max_placements)
+	for a in range(min_a, max_a + 1):
+		for b in range(min_b, max_b + 1):
+			if visited >= safety_limit:
+				break
+			visited += 1
+			var cell := _grid_cell_from_plane_axes(a, b)
+			var world_position := _grid_cell_center(cell, step)
+			var screen_position := camera.unproject_position(world_position)
+			var inside := screen_bounds.has_point(screen_position)
+			if area_tool_mode == 2:
+				inside = Geometry2D.is_point_in_polygon(screen_position, _lasso_points)
+			if inside:
+				var entry := _choose_weighted_entry(entries)
+				if not entry.is_empty() and _place_grid_fill_entry(entry, cell, step):
+					placed += 1
+		if visited >= safety_limit:
+			break
+	_finish_bulk_operation("Fill %d Grid Cells in %s" % [placed, "Rectangle" if area_tool_mode == 1 else "Lasso"])
+	_surface_feedback = "Filled %d grid cells" % placed
+	if visited >= safety_limit:
+		_surface_feedback += " (stopped at safety limit)"
+	_update_status()
+
+func _grid_reference_asset_path() -> String:
+	var entries := _current_weighted_entries()
+	if entries.is_empty():
+		return ""
+	return str(entries[0].get("path", ""))
+
+func _grid_cell_size() -> Vector3:
+	if grid_snap_mode == 1:
+		var reference_path := _grid_reference_asset_path()
+		if not reference_path.is_empty():
+			var measured := _get_asset_local_aabb(reference_path).size.abs()
+			if asset_placement_bounds.has(reference_path):
+				var stored: Variant = asset_placement_bounds[reference_path]
+				if stored is Vector3:
+					measured = (stored as Vector3).abs()
+				elif stored is Array and (stored as Array).size() >= 3:
+					measured = Vector3(float(stored[0]), float(stored[1]), float(stored[2])).abs()
+			return Vector3(maxf(measured.x, 0.001), maxf(measured.y, 0.001), maxf(measured.z, 0.001))
+	elif grid_snap_mode == 2:
+		var custom := grid_custom_snap.abs()
+		return Vector3(maxf(custom.x, 0.001), maxf(custom.y, 0.001), maxf(custom.z, 0.001))
+	var fixed := maxf(grid_snap, 0.001)
+	return Vector3(fixed, fixed, fixed)
+
+func _grid_plane_step(step: Vector3) -> Vector2:
+	return PainterGridMath.plane_step(grid_plane, step)
+
+func _world_to_grid_cell(position: Vector3, step: Vector3) -> Vector3i:
+	return PainterGridMath.world_to_cell(position, step)
+
+func _grid_cell_center(cell: Vector3i, step: Vector3) -> Vector3:
+	return PainterGridMath.cell_center(grid_plane, grid_offset, cell, step)
+
+func _grid_cell_axis_a(cell: Vector3i) -> int:
+	return PainterGridMath.cell_axis_a(grid_plane, cell)
+
+func _grid_cell_axis_b(cell: Vector3i) -> int:
+	return PainterGridMath.cell_axis_b(grid_plane, cell)
+
+func _grid_cell_from_plane_axes(a: int, b: int) -> Vector3i:
+	return PainterGridMath.cell_from_plane_axes(grid_plane, a, b)
+
+func _grid_plane_coordinates(position: Vector3) -> Vector2:
+	return PainterGridMath.plane_coordinates(grid_plane, position)
+
+func _grid_world_position(coordinate: Vector2) -> Vector3:
+	return PainterGridMath.world_position(grid_plane, grid_offset, coordinate)
+
+func _place_grid_fill_entry(entry: Dictionary, cell: Vector3i, step: Vector3) -> bool:
+	var path := str(entry.get("path", ""))
+	if path.is_empty():
+		return false
+	var normal := _grid_plane_normal()
+	var layer := _grid_layer_key(step)
+	if _grid_cell_is_occupied(cell, layer):
+		if not grid_override_occupied:
+			return false
+		_remove_grid_cell_assets(cell, layer)
+	var cell_center := _grid_cell_center(cell, step)
+	_stroke_sample_positions.append(cell_center)
+	_begin_grid_placement(cell, step)
+	if placement_mode == 1:
+		_place_multimesh(path, cell_center, normal)
+	else:
+		_place_scene(path, cell_center, normal)
+	_end_grid_placement()
+	return true
+
+func _grid_plane_normal() -> Vector3:
+	return PainterGridMath.plane_normal(grid_plane)
+
+func _grid_layer_key(step: Vector3) -> String:
+	return PainterGridMath.layer_key(grid_plane, grid_offset, step)
+
+func _begin_grid_placement(cell: Vector3i, step: Vector3) -> void:
+	_placing_on_grid = true
+	_active_grid_cell = cell
+	_active_grid_step = step
+	_active_grid_layer = _grid_layer_key(step)
+
+func _end_grid_placement() -> void:
+	_placing_on_grid = false
+	_active_grid_layer = ""
+
+func _grid_visual_anchor(path: String) -> Vector3:
+	var bounds := _get_asset_local_aabb(path)
+	match grid_plane:
+		0:
+			return Vector3(bounds.position.x + bounds.size.x * 0.5, bounds.position.y, bounds.position.z + bounds.size.z * 0.5)
+		1:
+			return Vector3(bounds.position.x + bounds.size.x * 0.5, bounds.position.y + bounds.size.y * 0.5, bounds.position.z)
+		2:
+			return Vector3(bounds.position.x, bounds.position.y + bounds.size.y * 0.5, bounds.position.z + bounds.size.z * 0.5)
+	return bounds.get_center()
+
+func _grid_corrected_root_position(path: String, cell_center: Vector3, basis: Basis) -> Vector3:
+	return cell_center - basis * _grid_visual_anchor(path) + _grid_plane_normal() * surface_offset
+
+func _grid_cell_is_occupied(cell: Vector3i, layer: String) -> bool:
+	if placement_parent == null:
+		return false
+	for child in placement_parent.get_children():
+		if child is MultiMeshInstance3D and child.has_meta("asset_painter_multimesh"):
+			if str(child.get_meta("asset_painter_grid_layer", "")) != layer:
+				continue
+			var cells: Array = child.get_meta("asset_painter_grid_cells", []) as Array
+			for value in cells:
+				if value is Vector3i and (value as Vector3i) == cell:
+					return true
+		elif child is Node3D and child.has_meta("asset_painter_placed"):
+			if str(child.get_meta("asset_painter_grid_layer", "")) == layer and child.get_meta("asset_painter_grid_cell", Vector3i(2147483647, 2147483647, 2147483647)) == cell:
+				return true
+	return false
+
+func _remove_grid_cell_assets(cell: Vector3i, layer: String) -> void:
+	if placement_parent == null:
+		return
+	for child in placement_parent.get_children():
+		if child is MultiMeshInstance3D and child.has_meta("asset_painter_multimesh"):
+			var mm := child as MultiMeshInstance3D
+			if mm.multimesh == null or str(mm.get_meta("asset_painter_grid_layer", "")) != layer:
+				continue
+			var cells: Array = mm.get_meta("asset_painter_grid_cells", []) as Array
+			var kept_transforms: Array[Transform3D] = []
+			var kept_cells: Array = []
+			for index in mm.multimesh.instance_count:
+				var existing_cell: Variant = cells[index] if index < cells.size() else null
+				if existing_cell is Vector3i and (existing_cell as Vector3i) == cell:
+					continue
+				kept_transforms.append(mm.multimesh.get_instance_transform(index))
+				kept_cells.append(existing_cell)
+			_set_multimesh_transforms(mm, kept_transforms)
+			mm.set_meta("asset_painter_grid_cells", kept_cells)
+		elif child is Node3D and child.has_meta("asset_painter_placed"):
+			if str(child.get_meta("asset_painter_grid_layer", "")) == layer and child.get_meta("asset_painter_grid_cell", Vector3i(2147483647, 2147483647, 2147483647)) == cell:
+				placement_parent.remove_child(child)
+				child.free()
+	_spacing_hash_dirty = true
+	_refresh_painted_nodes()
 
 func fill_selected_mesh() -> void:
 	if placement_parent == null or not is_instance_valid(placement_parent):
@@ -725,45 +930,37 @@ func _place_single_from_hit(hit: Dictionary) -> bool:
 	if entries.is_empty():
 		return false
 	var entry := _choose_weighted_entry(entries)
-	var normal: Vector3 = (hit["normal"] as Vector3).normalized()
-	var position: Vector3 = (hit["position"] as Vector3) + normal * surface_offset
-	var required_spacing := maxf(minimum_spacing, float(entry.get("minimum_spacing", 0.0)))
-	if not _is_far_enough(position, required_spacing):
-		return false
 	var path := str(entry.get("path", ""))
 	if path.is_empty():
+		return false
+	hit = _apply_grid_snap_for_asset(hit, path)
+	var normal: Vector3 = (hit["normal"] as Vector3).normalized()
+	var position: Vector3 = hit["position"] as Vector3
+	if bool(hit.get("grid_surface", false)):
+		var grid_cell: Vector3i = hit.get("grid_cell", Vector3i.ZERO) as Vector3i
+		var grid_step: Vector3 = hit.get("grid_step", _grid_cell_size()) as Vector3
+		var grid_layer := _grid_layer_key(grid_step)
+		if _grid_cell_is_occupied(grid_cell, grid_layer):
+			if not grid_override_occupied:
+				return false
+			_remove_grid_cell_assets(grid_cell, grid_layer)
+		_begin_grid_placement(grid_cell, grid_step)
+	else:
+		position += normal * surface_offset
+	var required_spacing := maxf(minimum_spacing, float(entry.get("minimum_spacing", 0.0)))
+	if not bool(hit.get("grid_surface", false)) and not _is_far_enough(position, required_spacing):
 		return false
 	_stroke_sample_positions.append(position)
 	if placement_mode == 1:
 		_place_multimesh(path, position, normal)
 	else:
 		_place_scene(path, position, normal)
+	if bool(hit.get("grid_surface", false)):
+		_end_grid_placement()
 	return true
 
 func _mesh_triangles(mesh_node: MeshInstance3D) -> Array[Dictionary]:
-	var result: Array[Dictionary] = []
-	var mesh := mesh_node.mesh
-	if mesh == null:
-		return result
-	for surface_index in mesh.get_surface_count():
-		var arrays := mesh.surface_get_arrays(surface_index)
-		if arrays.is_empty():
-			continue
-		var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-		var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
-		var triangle_count := indices.size() / 3 if not indices.is_empty() else vertices.size() / 3
-		for triangle_index in triangle_count:
-			var ia := indices[triangle_index * 3] if not indices.is_empty() else triangle_index * 3
-			var ib := indices[triangle_index * 3 + 1] if not indices.is_empty() else triangle_index * 3 + 1
-			var ic := indices[triangle_index * 3 + 2] if not indices.is_empty() else triangle_index * 3 + 2
-			var a := vertices[ia]
-			var b := vertices[ib]
-			var c := vertices[ic]
-			var cross := (b - a).cross(c - a)
-			var area := cross.length() * 0.5
-			if area > 0.000001:
-				result.append({"a": a, "b": b, "c": c, "normal": cross.normalized(), "area": area})
-	return result
+	return PainterGeometry.mesh_triangles(mesh_node)
 
 func _selected_area3d() -> Area3D:
 	for node in EditorInterface.get_selection().get_selected_nodes():
@@ -772,44 +969,16 @@ func _selected_area3d() -> Area3D:
 	return null
 
 func _first_collision_shape(area: Area3D) -> CollisionShape3D:
-	for node in area.find_children("*", "CollisionShape3D", true, false):
-		if node is CollisionShape3D and not (node as CollisionShape3D).disabled:
-			return node as CollisionShape3D
-	return null
+	return PainterGeometry.first_collision_shape(area)
 
 func _shape_local_aabb(shape: Shape3D) -> AABB:
-	if shape is BoxShape3D:
-		var size := (shape as BoxShape3D).size
-		return AABB(-size * 0.5, size)
-	if shape is SphereShape3D:
-		var radius := (shape as SphereShape3D).radius
-		return AABB(Vector3.ONE * -radius, Vector3.ONE * radius * 2.0)
-	if shape is CylinderShape3D:
-		var cylinder := shape as CylinderShape3D
-		return AABB(Vector3(-cylinder.radius, -cylinder.height * 0.5, -cylinder.radius), Vector3(cylinder.radius * 2.0, cylinder.height, cylinder.radius * 2.0))
-	if shape is CapsuleShape3D:
-		var capsule := shape as CapsuleShape3D
-		return AABB(Vector3(-capsule.radius, -capsule.height * 0.5, -capsule.radius), Vector3(capsule.radius * 2.0, capsule.height, capsule.radius * 2.0))
-	return AABB(Vector3(-0.5, -0.5, -0.5), Vector3.ONE)
+	return PainterGeometry.shape_local_aabb(shape)
 
 func _point_inside_shape(point: Vector3, shape: Shape3D) -> bool:
-	if shape is BoxShape3D:
-		var half := (shape as BoxShape3D).size * 0.5
-		return absf(point.x) <= half.x and absf(point.y) <= half.y and absf(point.z) <= half.z
-	if shape is SphereShape3D:
-		return point.length_squared() <= pow((shape as SphereShape3D).radius, 2.0)
-	if shape is CylinderShape3D:
-		var cylinder := shape as CylinderShape3D
-		return absf(point.y) <= cylinder.height * 0.5 and Vector2(point.x, point.z).length_squared() <= cylinder.radius * cylinder.radius
-	if shape is CapsuleShape3D:
-		var capsule := shape as CapsuleShape3D
-		var half_line := maxf(0.0, capsule.height * 0.5 - capsule.radius)
-		var clamped_y := clampf(point.y, -half_line, half_line)
-		return (point - Vector3(0.0, clamped_y, 0.0)).length_squared() <= capsule.radius * capsule.radius
-	return _shape_local_aabb(shape).has_point(point)
+	return PainterGeometry.point_inside_shape(point, shape)
 
 func _world_point_inside_shape(world_point: Vector3, shape_node: CollisionShape3D) -> bool:
-	return _point_inside_shape(shape_node.global_transform.affine_inverse() * world_point, shape_node.shape)
+	return PainterGeometry.world_point_inside_shape(world_point, shape_node)
 
 func _paint_at(mouse_pos: Vector2, camera: Camera3D, temporary_erase: bool, precise: bool) -> void:
 	if placement_parent == null or not is_instance_valid(placement_parent):
@@ -819,7 +988,16 @@ func _paint_at(mouse_pos: Vector2, camera: Camera3D, temporary_erase: bool, prec
 	if hit.is_empty() or not _passes_placement_filters(hit):
 		return
 	if temporary_erase or erase_mode:
-		if placement_mode == 1:
+		if bool(hit.get("grid_surface", false)):
+			var snapped_hit := _apply_grid_snap_for_asset(hit, _grid_reference_asset_path())
+			var erase_cell: Vector3i = snapped_hit.get("grid_cell", Vector3i.ZERO) as Vector3i
+			var erase_step: Vector3 = snapped_hit.get("grid_step", _grid_cell_size()) as Vector3
+			var erase_layer := _grid_layer_key(erase_step)
+			if placement_mode == 1:
+				_remove_grid_cell_assets(erase_cell, erase_layer)
+			else:
+				_erase_scene_grid_cell_with_undo(erase_cell, erase_layer)
+		elif placement_mode == 1:
 			_erase_multimesh_near(hit["position"] as Vector3)
 		else:
 			_erase_near(hit["position"] as Vector3)
@@ -854,13 +1032,25 @@ func _paint_at(mouse_pos: Vector2, camera: Camera3D, temporary_erase: bool, prec
 		var sample: Dictionary = hit if precise else _sample_surface_distributed(hit, camera, i, amount, event_samples)
 		if sample.is_empty() or not _passes_placement_filters(sample):
 			continue
-		var sample_normal: Vector3 = sample["normal"] as Vector3
-		var placement_position: Vector3 = (sample["position"] as Vector3) + sample_normal * surface_offset
-		var required_spacing: float = maxf(minimum_spacing, float(entry.get("minimum_spacing", 0.0)))
-		if not _is_far_enough(placement_position, required_spacing):
-			continue
 		var path: String = str(entry.get("path", ""))
 		if path.is_empty():
+			continue
+		sample = _apply_grid_snap_for_asset(sample, path)
+		var sample_normal: Vector3 = sample["normal"] as Vector3
+		var placement_position: Vector3 = sample["position"] as Vector3
+		if bool(sample.get("grid_surface", false)):
+			var grid_cell: Vector3i = sample.get("grid_cell", Vector3i.ZERO) as Vector3i
+			var grid_step: Vector3 = sample.get("grid_step", _grid_cell_size()) as Vector3
+			var grid_layer := _grid_layer_key(grid_step)
+			if _grid_cell_is_occupied(grid_cell, grid_layer):
+				if not grid_override_occupied:
+					continue
+				_remove_grid_cell_assets(grid_cell, grid_layer)
+			_begin_grid_placement(grid_cell, grid_step)
+		else:
+			placement_position += sample_normal * surface_offset
+		var required_spacing: float = maxf(minimum_spacing, float(entry.get("minimum_spacing", 0.0)))
+		if not bool(sample.get("grid_surface", false)) and not _is_far_enough(placement_position, required_spacing):
 			continue
 		event_samples.append(placement_position)
 		_stroke_sample_positions.append(placement_position)
@@ -868,23 +1058,14 @@ func _paint_at(mouse_pos: Vector2, camera: Camera3D, temporary_erase: bool, prec
 			_place_multimesh(path, placement_position, sample_normal)
 		else:
 			_place_scene(path, placement_position, sample_normal)
+		if bool(sample.get("grid_surface", false)):
+			_end_grid_placement()
 
 func _choose_weighted_entry(entries: Array[Dictionary]) -> Dictionary:
-	var total_weight := 0.0
-	for entry in entries:
-		total_weight += maxf(0.0, float(entry.get("weight", 0.0)))
-	if total_weight <= 0.0:
-		return {}
-	var choice := _rng.randf_range(0.0, total_weight)
-	var running := 0.0
-	for entry in entries:
-		running += maxf(0.0, float(entry.get("weight", 0.0)))
-		if choice <= running:
-			return entry
-	return entries.back() as Dictionary
+	return PainterSampling.choose_weighted_entry(entries, _rng)
 
 func _choose_weighted_path(entries: Array[Dictionary]) -> String:
-	return str(_choose_weighted_entry(entries).get("path", ""))
+	return PainterSampling.choose_weighted_path(entries, _rng)
 
 func _sample_surface_distributed(center_hit: Dictionary, camera: Camera3D, sample_index: int, sample_total: int, accepted: Array[Vector3]) -> Dictionary:
 	var center_normal: Vector3 = center_hit["normal"] as Vector3
@@ -922,32 +1103,17 @@ func _sample_surface_distributed(center_hit: Dictionary, camera: Camera3D, sampl
 	return best_hit
 
 func _distribution_offset(sample_index: int, sample_total: int, attempt: int) -> Vector2:
-	match distribution_mode:
-		2: # Clustered
-			var clusters: int = maxi(1, mini(cluster_count, sample_total))
-			var cluster_index: int = sample_index % clusters
-			var base_angle: float = TAU * float(cluster_index) / float(clusters) + _rng.randf_range(-0.35, 0.35)
-			var base_radius: float = brush_radius * _rng.randf_range(0.15, 0.72)
-			var center := Vector2(cos(base_angle), sin(base_angle)) * base_radius
-			var spread: float = brush_radius * lerpf(0.42, 0.06, cluster_strength)
-			var jitter_angle: float = _rng.randf_range(0.0, TAU)
-			var jitter_radius: float = sqrt(_rng.randf()) * spread
-			var result: Vector2 = center + Vector2(cos(jitter_angle), sin(jitter_angle)) * jitter_radius
-			return result.limit_length(brush_radius)
-		3: # Center bias
-			var angle: float = _rng.randf_range(0.0, TAU)
-			var power: float = 1.0 + maxf(0.25, brush_falloff) * 3.0
-			var radius: float = pow(_rng.randf(), power) * brush_radius
-			return Vector2(cos(angle), sin(angle)) * radius
-		4: # Edge bias
-			var angle: float = _rng.randf_range(0.0, TAU)
-			var power: float = 1.0 + maxf(0.25, brush_falloff) * 3.0
-			var radius: float = (1.0 - pow(_rng.randf(), power)) * brush_radius
-			return Vector2(cos(angle), sin(angle)) * radius
-		_:
-			var angle: float = _rng.randf_range(0.0, TAU)
-			var radius: float = sqrt(_rng.randf()) * brush_radius
-			return Vector2(cos(angle), sin(angle)) * radius
+	return PainterSampling.distribution_offset(
+		distribution_mode,
+		sample_index,
+		sample_total,
+		attempt,
+		brush_radius,
+		brush_falloff,
+		cluster_count,
+		cluster_strength,
+		_rng
+	)
 
 func _sample_surface(center_hit: Dictionary, camera: Camera3D) -> Dictionary:
 	var accepted: Array[Vector3] = []
@@ -976,18 +1142,22 @@ func _place_scene(path: String, position: Vector3, normal: Vector3) -> void:
 	var up: Vector3 = _alignment_up(normal)
 	instance_3d.global_basis = _basis_from_normal(up)
 	if random_rotation_enabled and random_rotation_x_enabled and random_rotation_x > 0.0:
-		instance_3d.rotate_object_local(Vector3.RIGHT, deg_to_rad(_rng.randf_range(-random_rotation_x, random_rotation_x)))
+		instance_3d.rotate_object_local(Vector3.RIGHT, deg_to_rad(_random_rotation_angle(random_rotation_x)))
 	if random_rotation_enabled and random_rotation_y_enabled and random_rotation_y > 0.0:
-		instance_3d.rotate_object_local(Vector3.UP, deg_to_rad(_rng.randf_range(-random_rotation_y, random_rotation_y)))
+		instance_3d.rotate_object_local(Vector3.UP, deg_to_rad(_random_rotation_angle(random_rotation_y)))
 	if random_rotation_enabled and random_rotation_z_enabled and random_rotation_z > 0.0:
-		instance_3d.rotate_object_local(Vector3.BACK, deg_to_rad(_rng.randf_range(-random_rotation_z, random_rotation_z)))
+		instance_3d.rotate_object_local(Vector3.BACK, deg_to_rad(_random_rotation_angle(random_rotation_z)))
 	var random_scale: float = 1.0
 	if random_scale_enabled:
 		random_scale = _rng.randf_range(minf(random_scale_min, random_scale_max), maxf(random_scale_min, random_scale_max))
 	instance_3d.scale *= Vector3.ONE * random_scale
+	if _placing_on_grid:
+		instance_3d.global_position = _grid_corrected_root_position(path, _grid_cell_center(_active_grid_cell, _active_grid_step), instance_3d.global_basis)
+		instance.set_meta("asset_painter_grid_cell", _active_grid_cell)
+		instance.set_meta("asset_painter_grid_layer", _active_grid_layer)
 	instance.set_meta("asset_painter_placed", true)
 	instance.set_meta("asset_source_path", path)
-	instance.set_meta("asset_painter_base_position", position)
+	instance.set_meta("asset_painter_base_position", instance_3d.global_position)
 	instance.set_meta("asset_painter_surface_normal", normal.normalized())
 	_stroke_nodes.append(instance)
 	_painted_nodes.append(instance_3d)
@@ -1005,15 +1175,17 @@ func _place_multimesh(path: String, position: Vector3, normal: Vector3) -> void:
 		return
 	var root_global := Transform3D(_basis_from_normal(_alignment_up(normal)), position)
 	if random_rotation_enabled and random_rotation_x_enabled and random_rotation_x > 0.0:
-		root_global.basis = root_global.basis.rotated(root_global.basis.x.normalized(), deg_to_rad(_rng.randf_range(-random_rotation_x, random_rotation_x)))
+		root_global.basis = root_global.basis.rotated(root_global.basis.x.normalized(), deg_to_rad(_random_rotation_angle(random_rotation_x)))
 	if random_rotation_enabled and random_rotation_y_enabled and random_rotation_y > 0.0:
-		root_global.basis = root_global.basis.rotated(root_global.basis.y.normalized(), deg_to_rad(_rng.randf_range(-random_rotation_y, random_rotation_y)))
+		root_global.basis = root_global.basis.rotated(root_global.basis.y.normalized(), deg_to_rad(_random_rotation_angle(random_rotation_y)))
 	if random_rotation_enabled and random_rotation_z_enabled and random_rotation_z > 0.0:
-		root_global.basis = root_global.basis.rotated(root_global.basis.z.normalized(), deg_to_rad(_rng.randf_range(-random_rotation_z, random_rotation_z)))
+		root_global.basis = root_global.basis.rotated(root_global.basis.z.normalized(), deg_to_rad(_random_rotation_angle(random_rotation_z)))
 	var random_scale: float = 1.0
 	if random_scale_enabled:
 		random_scale = _rng.randf_range(minf(random_scale_min, random_scale_max), maxf(random_scale_min, random_scale_max))
 	root_global.basis = root_global.basis.scaled(Vector3.ONE * random_scale)
+	if _placing_on_grid:
+		root_global.origin = _grid_corrected_root_position(path, _grid_cell_center(_active_grid_cell, _active_grid_step), root_global.basis)
 	var mesh_relative: Transform3D = asset_data["mesh_relative"] as Transform3D
 	var mesh_global: Transform3D = root_global * mesh_relative
 	var local_transform: Transform3D = mm_node.global_transform.affine_inverse() * mesh_global
@@ -1022,162 +1194,44 @@ func _place_multimesh(path: String, position: Vector3, normal: Vector3) -> void:
 		transforms.append(mm_node.multimesh.get_instance_transform(index))
 	transforms.append(local_transform)
 	_set_multimesh_transforms(mm_node, transforms)
-	_add_spacing_hash_position(position)
+	if _placing_on_grid:
+		var grid_cells: Array = mm_node.get_meta("asset_painter_grid_cells", []) as Array
+		grid_cells.append(_active_grid_cell)
+		mm_node.set_meta("asset_painter_grid_cells", grid_cells)
+	_add_spacing_hash_position(root_global.origin)
 
 func _get_multimesh_asset_data(path: String) -> Dictionary:
-	if _multimesh_asset_cache.has(path):
-		return _multimesh_asset_cache[path] as Dictionary
-	var packed: PackedScene = _scene_cache.get(path) as PackedScene
-	if packed == null:
-		packed = load(path) as PackedScene
-		if packed != null:
-			_scene_cache[path] = packed
-	if packed == null:
-		_multimesh_asset_cache[path] = {}
-		return {}
-	var root: Node = packed.instantiate()
-	if not root is Node3D:
-		root.free()
-		_multimesh_asset_cache[path] = {}
-		return {}
-	var mesh_node: MeshInstance3D = null
-	if root is MeshInstance3D and (root as MeshInstance3D).mesh != null:
-		mesh_node = root as MeshInstance3D
-	else:
-		var candidates: Array[Node] = root.find_children("*", "MeshInstance3D", true, false)
-		for candidate in candidates:
-			var candidate_mesh := candidate as MeshInstance3D
-			if candidate_mesh != null and candidate_mesh.mesh != null:
-				mesh_node = candidate_mesh
-				break
-	if mesh_node == null:
-		root.free()
-		_multimesh_asset_cache[path] = {}
-		return {}
-	var relative: Transform3D = Transform3D.IDENTITY if mesh_node == root else mesh_node.transform
-	var current: Node = mesh_node.get_parent()
-	while current != null and current != root:
-		if current is Node3D:
-			relative = (current as Node3D).transform * relative
-		current = current.get_parent()
-	var data := {
-		"mesh": mesh_node.mesh,
-		"material_override": mesh_node.material_override,
-		"mesh_relative": relative,
-		"cast_shadow": mesh_node.cast_shadow
-	}
-	root.free()
-	_multimesh_asset_cache[path] = data
-	return data
+	return PainterMultiMesh.get_asset_data(path, _multimesh_asset_cache, _scene_cache)
 
 func _get_or_create_multimesh_node(path: String, asset_data: Dictionary, world_position: Vector3 = Vector3.ZERO) -> MultiMeshInstance3D:
-	if placement_parent == null:
-		return null
-	var chunk_key := Vector2i.ZERO
-	if multimesh_chunking_enabled:
-		chunk_key = Vector2i(floori(world_position.x / multimesh_chunk_world_size), floori(world_position.z / multimesh_chunk_world_size))
-	for child in placement_parent.get_children():
-		if child is MultiMeshInstance3D and child.get_meta("asset_source_path", "") == path:
-			var existing := child as MultiMeshInstance3D
-			var same_chunk: bool = not multimesh_chunking_enabled or Vector2i(existing.get_meta("asset_painter_chunk", Vector2i.ZERO)) == chunk_key
-			var below_limit: bool = existing.multimesh == null or existing.multimesh.instance_count < multimesh_chunk_instance_limit
-			if same_chunk and below_limit:
-				return existing
-	var node := MultiMeshInstance3D.new()
-	var asset_name: String = path.get_file().get_basename().validate_node_name()
-	if asset_name.is_empty():
-		asset_name = "PaintedAsset"
-	node.name = "MM_" + asset_name
-	if multimesh_chunking_enabled:
-		node.name += "_%d_%d" % [chunk_key.x, chunk_key.y]
-		node.set_meta("asset_painter_chunk", chunk_key)
-	node.set_meta("asset_painter_multimesh", true)
-	node.set_meta("asset_painter_placed", true)
-	node.set_meta("asset_source_path", path)
-	node.multimesh = MultiMesh.new()
-	node.multimesh.transform_format = MultiMesh.TRANSFORM_3D
-	node.multimesh.mesh = asset_data["mesh"] as Mesh
-	node.multimesh.instance_count = 0
-	node.material_override = asset_data["material_override"] as Material
-	node.cast_shadow = int(asset_data["cast_shadow"])
-	node.visibility_range_begin = multimesh_visibility_begin
-	node.visibility_range_end = multimesh_visibility_end
-	placement_parent.add_child(node, true)
-	node.owner = EditorInterface.get_edited_scene_root()
-	return node
+	return PainterMultiMesh.get_or_create_node(
+		placement_parent,
+		path,
+		asset_data,
+		world_position,
+		multimesh_chunking_enabled,
+		multimesh_chunk_world_size,
+		multimesh_chunk_instance_limit,
+		multimesh_visibility_begin,
+		multimesh_visibility_end,
+		_placing_on_grid,
+		_active_grid_layer
+	)
 
 func _erase_multimesh_near(position: Vector3) -> void:
-	if placement_parent == null:
-		return
-	for child in placement_parent.get_children():
-		if not child is MultiMeshInstance3D or not child.has_meta("asset_painter_multimesh"):
-			continue
-		var mm_node := child as MultiMeshInstance3D
-		if mm_node.multimesh == null:
-			continue
-		var kept: Array[Transform3D] = []
-		for index in mm_node.multimesh.instance_count:
-			var transform: Transform3D = mm_node.multimesh.get_instance_transform(index)
-			var global_position: Vector3 = (mm_node.global_transform * transform).origin
-			if global_position.distance_to(position) > brush_radius:
-				kept.append(transform)
-		_set_multimesh_transforms(mm_node, kept)
+	if PainterMultiMesh.erase_near(placement_parent, position, brush_radius):
+		_spacing_hash_dirty = true
 
 func _set_multimesh_transforms(node: MultiMeshInstance3D, transforms: Array[Transform3D]) -> void:
 	_spacing_hash_dirty = true
-	if node.multimesh == null:
-		return
-	node.multimesh.instance_count = transforms.size()
-	for index in transforms.size():
-		node.multimesh.set_instance_transform(index, transforms[index])
+	PainterMultiMesh.set_transforms(node, transforms)
 
 func _capture_multimesh_snapshot() -> Array:
-	var snapshot: Array = []
-	if placement_parent == null or not is_instance_valid(placement_parent):
-		return snapshot
-	for child in placement_parent.get_children():
-		if not child is MultiMeshInstance3D or not child.has_meta("asset_painter_multimesh"):
-			continue
-		var node := child as MultiMeshInstance3D
-		var transforms: Array[Transform3D] = []
-		if node.multimesh != null:
-			for index in node.multimesh.instance_count:
-				transforms.append(node.multimesh.get_instance_transform(index))
-		snapshot.append({
-			"path": str(node.get_meta("asset_source_path", "")),
-			"name": str(node.name),
-			"mesh": node.multimesh.mesh if node.multimesh != null else null,
-			"material_override": node.material_override,
-			"cast_shadow": node.cast_shadow,
-			"transforms": transforms
-		})
-	return snapshot
+	return PainterMultiMesh.capture_snapshot(placement_parent)
 
 func _apply_multimesh_snapshot(parent: Node3D, snapshot: Array) -> void:
-	if parent == null or not is_instance_valid(parent):
-		return
-	for child in parent.get_children():
-		if child is MultiMeshInstance3D and child.has_meta("asset_painter_multimesh"):
-			parent.remove_child(child)
-			child.free()
-	for entry_value in snapshot:
-		var entry: Dictionary = entry_value as Dictionary
-		var node := MultiMeshInstance3D.new()
-		node.name = str(entry.get("name", "PaintedMultiMesh"))
-		node.set_meta("asset_painter_multimesh", true)
-		node.set_meta("asset_painter_placed", true)
-		node.set_meta("asset_source_path", str(entry.get("path", "")))
-		node.multimesh = MultiMesh.new()
-		node.multimesh.transform_format = MultiMesh.TRANSFORM_3D
-		node.multimesh.mesh = entry.get("mesh") as Mesh
-		node.material_override = entry.get("material_override") as Material
-		node.cast_shadow = int(entry.get("cast_shadow", GeometryInstance3D.SHADOW_CASTING_SETTING_ON))
-		parent.add_child(node, true)
-		node.owner = EditorInterface.get_edited_scene_root()
-		var transforms: Array[Transform3D] = []
-		for transform_value in entry.get("transforms", []):
-			transforms.append(transform_value as Transform3D)
-		_set_multimesh_transforms(node, transforms)
+	PainterMultiMesh.apply_snapshot(parent, snapshot)
+	_spacing_hash_dirty = true
 
 func _commit_multimesh_stroke(action_name: String = "Paint MultiMesh Assets") -> void:
 	if not _multimesh_stroke_active or placement_parent == null:
@@ -1208,11 +1262,11 @@ func _randomized_basis(normal: Vector3) -> Basis:
 	var basis := _basis_from_normal(_alignment_up(normal))
 	if reapply_rotation:
 		if random_rotation_enabled and random_rotation_x_enabled and random_rotation_x > 0.0:
-			basis = basis.rotated(basis.x.normalized(), deg_to_rad(_rng.randf_range(-random_rotation_x, random_rotation_x)))
+			basis = basis.rotated(basis.x.normalized(), deg_to_rad(_random_rotation_angle(random_rotation_x)))
 		if random_rotation_enabled and random_rotation_y_enabled and random_rotation_y > 0.0:
-			basis = basis.rotated(basis.y.normalized(), deg_to_rad(_rng.randf_range(-random_rotation_y, random_rotation_y)))
+			basis = basis.rotated(basis.y.normalized(), deg_to_rad(_random_rotation_angle(random_rotation_y)))
 		if random_rotation_enabled and random_rotation_z_enabled and random_rotation_z > 0.0:
-			basis = basis.rotated(basis.z.normalized(), deg_to_rad(_rng.randf_range(-random_rotation_z, random_rotation_z)))
+			basis = basis.rotated(basis.z.normalized(), deg_to_rad(_random_rotation_angle(random_rotation_z)))
 	return basis
 
 func _reapply_scenes_near(center: Vector3, brush_normal: Vector3) -> void:
@@ -1336,7 +1390,10 @@ func _capture_scene_snapshot() -> Array:
 				"path": str(child.get_meta("asset_source_path", "")),
 				"transform": (child as Node3D).transform,
 				"base_position": child.get_meta("asset_painter_base_position", (child as Node3D).global_position),
-				"normal": child.get_meta("asset_painter_surface_normal", Vector3.UP)
+				"normal": child.get_meta("asset_painter_surface_normal", Vector3.UP),
+				"grid_layer": str(child.get_meta("asset_painter_grid_layer", "")),
+				"grid_cell": child.get_meta("asset_painter_grid_cell", Vector3i.ZERO),
+				"has_grid_cell": child.has_meta("asset_painter_grid_cell")
 			})
 	return snapshot
 
@@ -1365,6 +1422,9 @@ func _apply_scene_snapshot(parent: Node3D, snapshot: Array) -> void:
 		node.set_meta("asset_source_path", path)
 		node.set_meta("asset_painter_base_position", item.get("base_position", (node as Node3D).global_position))
 		node.set_meta("asset_painter_surface_normal", item.get("normal", Vector3.UP))
+		if bool(item.get("has_grid_cell", false)):
+			node.set_meta("asset_painter_grid_layer", str(item.get("grid_layer", "")))
+			node.set_meta("asset_painter_grid_cell", item.get("grid_cell", Vector3i.ZERO) as Vector3i)
 	_refresh_painted_nodes()
 
 func _commit_scene_reapply() -> void:
@@ -1378,6 +1438,37 @@ func _commit_scene_reapply() -> void:
 	_apply_scene_snapshot(placement_parent, before)
 	var ur := plugin.get_undo_redo()
 	ur.create_action("Reapply Painted Assets")
+	ur.add_do_method(self, "_apply_scene_snapshot", placement_parent, after)
+	ur.add_undo_method(self, "_apply_scene_snapshot", placement_parent, before)
+	ur.commit_action()
+
+func _commit_scene_grid_override() -> void:
+	if not _scene_grid_override_active or placement_parent == null:
+		return
+	_scene_grid_override_active = false
+	_stroke_nodes.clear()
+	var before := _scene_before_snapshot.duplicate(true)
+	var after := _capture_scene_snapshot()
+	if before == after:
+		return
+	_apply_scene_snapshot(placement_parent, before)
+	var ur := plugin.get_undo_redo()
+	ur.create_action("Paint and Replace Grid Assets")
+	ur.add_do_method(self, "_apply_scene_snapshot", placement_parent, after)
+	ur.add_undo_method(self, "_apply_scene_snapshot", placement_parent, before)
+	ur.commit_action()
+
+func _erase_scene_grid_cell_with_undo(cell: Vector3i, layer: String) -> void:
+	if placement_parent == null:
+		return
+	var before := _capture_scene_snapshot()
+	_remove_grid_cell_assets(cell, layer)
+	var after := _capture_scene_snapshot()
+	if before == after:
+		return
+	_apply_scene_snapshot(placement_parent, before)
+	var ur := plugin.get_undo_redo()
+	ur.create_action("Erase Grid Cell")
 	ur.add_do_method(self, "_apply_scene_snapshot", placement_parent, after)
 	ur.add_undo_method(self, "_apply_scene_snapshot", placement_parent, before)
 	ur.commit_action()
@@ -1418,72 +1509,38 @@ func _commit_stroke() -> void:
 	_stroke_nodes.clear()
 
 func _spacing_hash_key(position: Vector3) -> Vector3i:
-	var size := maxf(0.25, spatial_hash_cell_size)
-	return Vector3i(floori(position.x / size), floori(position.y / size), floori(position.z / size))
+	return PainterSpatialHash.key_for_position(position, spatial_hash_cell_size)
 
 func _add_spacing_hash_position(position: Vector3) -> void:
 	if not use_spatial_hash:
 		return
 	if _spacing_hash_dirty:
 		_rebuild_spacing_hash()
-	var key := _spacing_hash_key(position)
-	if not _spacing_hash.has(key):
-		_spacing_hash[key] = []
-	(_spacing_hash[key] as Array).append(position)
+	PainterSpatialHash.add_position(_spacing_hash, position, spatial_hash_cell_size)
 
 func _rebuild_spacing_hash() -> void:
-	_spacing_hash.clear()
-	if placement_parent == null or not is_instance_valid(placement_parent):
-		_spacing_hash_dirty = false
-		return
-	for child in placement_parent.get_children():
-		if child is MultiMeshInstance3D and child.has_meta("asset_painter_multimesh"):
-			var mm := child as MultiMeshInstance3D
-			if mm.multimesh != null:
-				for index in mm.multimesh.instance_count:
-					var pos := (mm.global_transform * mm.multimesh.get_instance_transform(index)).origin
-					var key := _spacing_hash_key(pos)
-					if not _spacing_hash.has(key): _spacing_hash[key] = []
-					(_spacing_hash[key] as Array).append(pos)
-		elif child is Node3D and child.has_meta("asset_painter_placed"):
-			var pos := (child as Node3D).global_position
-			var key := _spacing_hash_key(pos)
-			if not _spacing_hash.has(key): _spacing_hash[key] = []
-			(_spacing_hash[key] as Array).append(pos)
+	PainterSpatialHash.rebuild(_spacing_hash, placement_parent, spatial_hash_cell_size)
 	_spacing_hash_dirty = false
 
 func _is_far_enough(position: Vector3, required_spacing: float = -1.0) -> bool:
 	var spacing: float = minimum_spacing if required_spacing < 0.0 else required_spacing
 	if spacing <= 0.0 or placement_parent == null:
 		return true
-	var minimum_squared := spacing * spacing
 	if use_spatial_hash:
 		if _spacing_hash_dirty:
 			_rebuild_spacing_hash()
-		var center := _spacing_hash_key(position)
-		var reach := ceili(spacing / maxf(0.25, spatial_hash_cell_size))
-		for x in range(center.x - reach, center.x + reach + 1):
-			for y in range(center.y - reach, center.y + reach + 1):
-				for z in range(center.z - reach, center.z + reach + 1):
-					var key := Vector3i(x, y, z)
-					if not _spacing_hash.has(key): continue
-					for existing: Vector3 in _spacing_hash[key]:
-						if existing.distance_squared_to(position) < minimum_squared:
-							return false
-		return true
-	# Compatibility fallback when hashing is disabled.
-	for painted in _painted_nodes:
-		if painted != null and is_instance_valid(painted) and painted.get_parent() == placement_parent and painted.global_position.distance_squared_to(position) < minimum_squared:
-			return false
-	for child in placement_parent.get_children():
-		if child is MultiMeshInstance3D and child.has_meta("asset_painter_multimesh"):
-			var mm_node := child as MultiMeshInstance3D
-			if mm_node.multimesh != null:
-				for index in mm_node.multimesh.instance_count:
-					var global_position := (mm_node.global_transform * mm_node.multimesh.get_instance_transform(index)).origin
-					if global_position.distance_squared_to(position) < minimum_squared:
-						return false
-	return true
+		return PainterSpatialHash.is_far_enough_hashed(
+			_spacing_hash,
+			position,
+			spacing,
+			spatial_hash_cell_size
+		)
+	return PainterSpatialHash.is_far_enough_linear(
+		position,
+		spacing,
+		placement_parent,
+		_painted_nodes
+	)
 
 func _refresh_painted_nodes() -> void:
 	_painted_nodes.clear()
@@ -1623,6 +1680,7 @@ func _store_surface_path_settings(path_node: Path3D) -> void:
 	path_node.set_meta("asset_painter_surface_offset", surface_offset)
 	path_node.set_meta("asset_painter_live_update", path_live_update)
 	path_node.set_meta("asset_painter_update_delay", path_update_delay)
+	path_node.set_meta("asset_painter_path_max_placements", path_max_placements)
 
 func _surface_path_entries(path_node: Path3D) -> Array[Dictionary]:
 	var result: Array[Dictionary] = []
@@ -1689,6 +1747,7 @@ func _apply_surface_path_settings(path_node: Path3D) -> Dictionary:
 		"path_spacing_max": path_spacing_max,
 		"path_asset_order": path_asset_order,
 		"path_align_direction": path_align_direction,
+		"path_max_placements": path_max_placements,
 		"random_seed": random_seed,
 		"surface_offset": surface_offset,
 	}
@@ -1702,6 +1761,7 @@ func _apply_surface_path_settings(path_node: Path3D) -> Dictionary:
 	path_spacing_max = float(path_node.get_meta("asset_painter_path_spacing_max", path_spacing_max))
 	path_asset_order = int(path_node.get_meta("asset_painter_path_asset_order", path_asset_order))
 	path_align_direction = bool(path_node.get_meta("asset_painter_path_align_direction", path_align_direction))
+	path_max_placements = clampi(int(path_node.get_meta("asset_painter_path_max_placements", path_max_placements)), 1, 10000)
 	random_seed = int(path_node.get_meta("asset_painter_random_seed", random_seed))
 	surface_offset = float(path_node.get_meta("asset_painter_surface_offset", surface_offset))
 	return previous
@@ -1717,6 +1777,7 @@ func _restore_surface_path_settings(previous: Dictionary) -> void:
 	path_spacing_max = float(previous.get("path_spacing_max", path_spacing_max))
 	path_asset_order = int(previous.get("path_asset_order", path_asset_order))
 	path_align_direction = bool(previous.get("path_align_direction", path_align_direction))
+	path_max_placements = int(previous.get("path_max_placements", path_max_placements))
 	random_seed = int(previous.get("random_seed", random_seed))
 	surface_offset = float(previous.get("surface_offset", surface_offset))
 
@@ -1766,15 +1827,7 @@ func bake_selected_surface_path() -> void:
 		_update_status()
 
 func _draw_surface_path_preview() -> void:
-	if not active or area_tool_mode != 3 or _viewport_camera == null:
-		return
-	if _path_screen_points.size() >= 2:
-		for index in range(_path_screen_points.size() - 1):
-			draw_line(_path_screen_points[index], _path_screen_points[index + 1], Color(0.2, 0.95, 0.65, 0.95), 3.0, true)
-	for point in _path_screen_points:
-		draw_circle(point, 3.5, Color(0.8, 1.0, 0.9, 0.95))
-	if _path_drawing and not _path_screen_points.is_empty():
-		draw_line(_path_screen_points[_path_screen_points.size() - 1], _mouse_position, Color(0.2, 0.95, 0.65, 0.45), 1.5, true)
+	PainterPreview.draw_surface_path(self, active, area_tool_mode, _viewport_camera, _path_screen_points, _path_drawing, _mouse_position)
 
 func scatter_selected_path() -> void:
 	var selected_nodes: Array[Node] = EditorInterface.get_selection().get_selected_nodes()
@@ -1816,8 +1869,11 @@ func _scatter_path_node(path_node: Path3D) -> int:
 	var placed := 0
 	var asset_sequence_index := 0
 	var distance := 0.0
-	var safety := maxi(1, area_max_placements)
-	while distance <= curve_length and placed < safety:
+	var safety := clampi(path_max_placements, 1, 10000)
+	var iteration_limit := maxi(1000, safety * 20)
+	var iterations := 0
+	while distance <= curve_length and placed < safety and iterations < iteration_limit:
+		iterations += 1
 		var local_position: Vector3 = path_node.curve.sample_baked(distance, true)
 		var world_position: Vector3 = path_node.global_transform * local_position
 		var epsilon: float = minf(0.25, maxf(0.02, curve_length * 0.002))
@@ -1885,8 +1941,15 @@ func _scatter_path_node(path_node: Path3D) -> int:
 			step_distance = _rng.randf_range(minf(path_spacing_min, path_spacing_max), maxf(path_spacing_min, path_spacing_max))
 		else:
 			step_distance = path_spacing_min
-		distance += maxf(0.01, step_distance)
+		# Never advance more densely than the global spacing setting. This avoids
+		# accidental floods when path spacing is set near zero.
+		var effective_step: float = maxf(0.1, maxf(step_distance, minimum_spacing))
+		distance += effective_step
 	_finish_bulk_operation("Scatter %d Assets Along Surface Path" % placed)
+	if placed >= safety:
+		_surface_feedback = "Surface path stopped at the %d asset safety limit" % safety
+	elif iterations >= iteration_limit:
+		_surface_feedback = "Surface path stopped because spacing was too dense"
 	_path_entries_override.clear()
 	placement_parent = original_parent
 	return placed
@@ -1945,28 +2008,16 @@ func _raycast_world_segment(origin: Vector3, ray_end: Vector3) -> Dictionary:
 	return _raycast_visible_meshes(origin, ray_end, (ray_end - origin).normalized())
 
 func _basis_from_direction(direction: Vector3, requested_up: Vector3) -> Basis:
-	var forward: Vector3 = direction.normalized()
-	var up: Vector3 = requested_up.normalized()
-	if forward.length_squared() < 0.0001:
-		return _basis_from_normal(up)
-	if absf(forward.dot(up)) > 0.98:
-		if absf(forward.dot(Vector3.UP)) < 0.98:
-			up = Vector3.UP
-		else:
-			up = Vector3.RIGHT
-	var z_axis: Vector3 = -forward
-	var x_axis: Vector3 = up.cross(z_axis).normalized()
-	var y_axis: Vector3 = z_axis.cross(x_axis).normalized()
-	return Basis(x_axis, y_axis, z_axis).orthonormalized()
+	return PainterGeometry.basis_from_direction(direction, requested_up)
 
 func _randomized_path_basis(base_basis: Basis) -> Basis:
 	var result := base_basis
 	if random_rotation_enabled and random_rotation_x_enabled and random_rotation_x > 0.0:
-		result = result.rotated(result.x.normalized(), deg_to_rad(_rng.randf_range(-random_rotation_x, random_rotation_x)))
+		result = result.rotated(result.x.normalized(), deg_to_rad(_random_rotation_angle(random_rotation_x)))
 	if random_rotation_enabled and random_rotation_y_enabled and random_rotation_y > 0.0:
-		result = result.rotated(result.y.normalized(), deg_to_rad(_rng.randf_range(-random_rotation_y, random_rotation_y)))
+		result = result.rotated(result.y.normalized(), deg_to_rad(_random_rotation_angle(random_rotation_y)))
 	if random_rotation_enabled and random_rotation_z_enabled and random_rotation_z > 0.0:
-		result = result.rotated(result.z.normalized(), deg_to_rad(_rng.randf_range(-random_rotation_z, random_rotation_z)))
+		result = result.rotated(result.z.normalized(), deg_to_rad(_random_rotation_angle(random_rotation_z)))
 	var random_scale: float = 1.0
 	if random_scale_enabled:
 		random_scale = _rng.randf_range(minf(random_scale_min, random_scale_max), maxf(random_scale_min, random_scale_max))
@@ -2000,7 +2051,7 @@ func _place_path_scene(path: String, position: Vector3, normal: Vector3, basis: 
 	instance_3d.global_transform = Transform3D(_randomized_path_basis(basis), position)
 	instance.set_meta("asset_painter_placed", true)
 	instance.set_meta("asset_source_path", path)
-	instance.set_meta("asset_painter_base_position", position)
+	instance.set_meta("asset_painter_base_position", instance_3d.global_position)
 	instance.set_meta("asset_painter_surface_normal", normal.normalized())
 	_stroke_nodes.append(instance)
 	_painted_nodes.append(instance_3d)
@@ -2026,15 +2077,7 @@ func _place_path_multimesh(path: String, position: Vector3, basis: Basis) -> boo
 	return true
 
 func _alignment_up(normal: Vector3) -> Vector3:
-	match align_mode:
-		1:
-			return Vector3.UP
-		2:
-			return Vector3.UP.slerp(normal.normalized(), clampf(blend_amount, 0.0, 1.0)).normalized()
-		3:
-			return Vector3.UP
-		_:
-			return normal.normalized()
+	return PainterGeometry.alignment_up(align_mode, blend_amount, normal)
 
 func _raycast_scene(mouse_pos: Vector2, camera: Camera3D) -> Dictionary:
 	if camera == null:
@@ -2043,10 +2086,204 @@ func _raycast_scene(mouse_pos: Vector2, camera: Camera3D) -> Dictionary:
 	var ray_direction: Vector3 = camera.project_ray_normal(mouse_pos).normalized()
 	var ray_end: Vector3 = origin + ray_direction * 4096.0
 
+	if surface_mode == 2:
+		return _raycast_grid_plane(origin, ray_direction)
+
 	var physics_hit: Dictionary = _raycast_physics(origin, ray_end)
 	if not physics_hit.is_empty():
 		return physics_hit
-	return _raycast_visible_meshes(origin, ray_end, ray_direction)
+	var mesh_hit: Dictionary = _raycast_visible_meshes(origin, ray_end, ray_direction)
+	if not mesh_hit.is_empty():
+		return mesh_hit
+	if surface_mode == 1:
+		return _raycast_grid_plane(origin, ray_direction)
+	return {}
+
+func _raycast_grid_plane(origin: Vector3, ray_direction: Vector3) -> Dictionary:
+	var normal := Vector3.UP
+	var plane_point := Vector3(0.0, grid_offset, 0.0)
+	match grid_plane:
+		1:
+			normal = Vector3.BACK
+			plane_point = Vector3(0.0, 0.0, grid_offset)
+		2:
+			normal = Vector3.RIGHT
+			plane_point = Vector3(grid_offset, 0.0, 0.0)
+	var denominator: float = ray_direction.dot(normal)
+	if absf(denominator) < 0.00001:
+		return {}
+	var distance: float = (plane_point - origin).dot(normal) / denominator
+	if distance < 0.0:
+		return {}
+	var hit_position: Vector3 = origin + ray_direction * distance
+	return {"position": hit_position, "normal": normal, "collider": null, "grid_surface": true}
+
+func _apply_grid_snap_for_asset(hit: Dictionary, _path: String) -> Dictionary:
+	if hit.is_empty() or not bool(hit.get("grid_surface", false)):
+		return hit
+	var result := hit.duplicate()
+	var step := _grid_cell_size()
+	var position: Vector3 = result["position"] as Vector3
+	var cell := _world_to_grid_cell(position, step)
+	result["position"] = _grid_cell_center(cell, step)
+	result["grid_cell"] = cell
+	result["grid_step"] = step
+	return result
+
+func _get_asset_local_aabb(path: String) -> AABB:
+	if _asset_bounds_cache.has(path):
+		return _asset_bounds_cache[path] as AABB
+	var packed: PackedScene = _scene_cache.get(path) as PackedScene
+	if packed == null:
+		packed = load(path) as PackedScene
+		if packed != null:
+			_scene_cache[path] = packed
+	if packed == null:
+		return AABB(Vector3.ZERO, Vector3.ONE)
+	var root := packed.instantiate()
+	if not root is Node3D:
+		root.free()
+		return AABB(Vector3.ZERO, Vector3.ONE)
+	var combined := AABB()
+	var has_bounds := false
+	var mesh_nodes: Array[Node] = []
+	if root is MeshInstance3D:
+		mesh_nodes.append(root)
+	mesh_nodes.append_array(root.find_children("*", "MeshInstance3D", true, false))
+	for node in mesh_nodes:
+		var mesh_node := node as MeshInstance3D
+		if mesh_node == null or mesh_node.mesh == null:
+			continue
+		var relative := _node_transform_relative_to_root(mesh_node, root as Node3D)
+		var transformed := relative * mesh_node.mesh.get_aabb()
+		if not has_bounds:
+			combined = transformed
+			has_bounds = true
+		else:
+			combined = combined.merge(transformed)
+	root.free()
+	if not has_bounds:
+		combined = AABB(Vector3.ZERO, Vector3.ONE)
+	_asset_bounds_cache[path] = combined
+	return combined
+
+func _node_transform_relative_to_root(node: Node3D, root: Node3D) -> Transform3D:
+	if node == root:
+		return Transform3D.IDENTITY
+	var result := node.transform
+	var current := node.get_parent()
+	while current != null and current != root:
+		if current is Node3D:
+			result = (current as Node3D).transform * result
+		current = current.get_parent()
+	return result
+
+func _grid_position_is_occupied(new_path: String, position: Vector3, normal: Vector3) -> bool:
+	if placement_parent == null:
+		return false
+	var new_root := Transform3D(_basis_from_normal(_alignment_up(normal)), position)
+	var new_bounds: AABB = new_root * _get_asset_local_aabb(new_path)
+	if placement_mode == 1:
+		for child in placement_parent.get_children():
+			if not child is MultiMeshInstance3D or not child.has_meta("asset_painter_multimesh"):
+				continue
+			var mm := child as MultiMeshInstance3D
+			if mm.multimesh == null:
+				continue
+			var old_path := str(mm.get_meta("asset_source_path", ""))
+			var asset_data := _get_multimesh_asset_data(old_path)
+			if asset_data.is_empty():
+				continue
+			var inverse_mesh_relative: Transform3D = (asset_data["mesh_relative"] as Transform3D).affine_inverse()
+			var old_local_bounds := _get_asset_local_aabb(old_path)
+			for index in mm.multimesh.instance_count:
+				var local_transform := mm.multimesh.get_instance_transform(index)
+				var root_global: Transform3D = (mm.global_transform * local_transform) * inverse_mesh_relative
+				if _grid_bounds_overlap(new_bounds, root_global * old_local_bounds):
+					return true
+	else:
+		for child in placement_parent.get_children():
+			if not child is Node3D or child is MultiMeshInstance3D or not child.has_meta("asset_painter_placed"):
+				continue
+			var old_path := str(child.get_meta("asset_source_path", ""))
+			if old_path.is_empty():
+				continue
+			var old_bounds: AABB = (child as Node3D).global_transform * _get_asset_local_aabb(old_path)
+			if _grid_bounds_overlap(new_bounds, old_bounds):
+				return true
+	return false
+
+func _remove_occupied_grid_assets(new_path: String, position: Vector3, normal: Vector3) -> void:
+	if placement_parent == null:
+		return
+	var new_root := Transform3D(_basis_from_normal(_alignment_up(normal)), position)
+	var new_bounds: AABB = new_root * _get_asset_local_aabb(new_path)
+	var changed := false
+	if placement_mode == 1:
+		for child in placement_parent.get_children():
+			if not child is MultiMeshInstance3D or not child.has_meta("asset_painter_multimesh"):
+				continue
+			var mm := child as MultiMeshInstance3D
+			if mm.multimesh == null:
+				continue
+			var old_path := str(mm.get_meta("asset_source_path", ""))
+			var asset_data := _get_multimesh_asset_data(old_path)
+			if asset_data.is_empty():
+				continue
+			var inverse_mesh_relative: Transform3D = (asset_data["mesh_relative"] as Transform3D).affine_inverse()
+			var old_local_bounds := _get_asset_local_aabb(old_path)
+			var kept: Array[Transform3D] = []
+			for index in mm.multimesh.instance_count:
+				var local_transform := mm.multimesh.get_instance_transform(index)
+				var mesh_global: Transform3D = mm.global_transform * local_transform
+				var root_global: Transform3D = mesh_global * inverse_mesh_relative
+				var old_bounds: AABB = root_global * old_local_bounds
+				if _grid_bounds_overlap(new_bounds, old_bounds):
+					changed = true
+				else:
+					kept.append(local_transform)
+			if kept.size() != mm.multimesh.instance_count:
+				_set_multimesh_transforms(mm, kept)
+	else:
+		var remove_nodes: Array[Node] = []
+		for child in placement_parent.get_children():
+			if not child is Node3D or child is MultiMeshInstance3D or not child.has_meta("asset_painter_placed"):
+				continue
+			var old_path := str(child.get_meta("asset_source_path", ""))
+			if old_path.is_empty():
+				continue
+			var old_bounds: AABB = (child as Node3D).global_transform * _get_asset_local_aabb(old_path)
+			if _grid_bounds_overlap(new_bounds, old_bounds):
+				remove_nodes.append(child)
+		for node in remove_nodes:
+			placement_parent.remove_child(node)
+			node.free()
+			changed = true
+	if changed:
+		_spacing_hash_dirty = true
+		_refresh_painted_nodes()
+
+func _grid_bounds_overlap(a: AABB, b: AABB) -> bool:
+	# Shrink very slightly so assets that only touch at their edges are not replaced.
+	var epsilon := 0.001
+	var a_min := a.position + Vector3.ONE * epsilon
+	var a_max := a.end - Vector3.ONE * epsilon
+	var b_min := b.position + Vector3.ONE * epsilon
+	var b_max := b.end - Vector3.ONE * epsilon
+	return (
+		a_min.x < b_max.x and a_max.x > b_min.x
+		and a_min.y < b_max.y and a_max.y > b_min.y
+		and a_min.z < b_max.z and a_max.z > b_min.z
+	)
+
+func _random_rotation_angle(maximum_degrees: float) -> float:
+	return PainterSampling.random_rotation_angle(
+		maximum_degrees,
+		_placing_on_grid,
+		grid_rotation_snap_enabled,
+		grid_rotation_snap_degrees,
+		_rng
+	)
 
 func _raycast_physics(origin: Vector3, ray_end: Vector3) -> Dictionary:
 	if _viewport_camera == null or not is_instance_valid(_viewport_camera) or _viewport_camera.get_world_3d() == null:
@@ -2079,19 +2316,50 @@ func _raycast_physics(origin: Vector3, ray_end: Vector3) -> Dictionary:
 		return {"position": hit_position + hit_normal * 0.002, "normal": hit_normal, "collider": collider}
 	return {}
 
-func _raycast_visible_meshes(origin: Vector3, ray_end: Vector3, ray_direction: Vector3) -> Dictionary:
+func _refresh_visible_mesh_cache() -> void:
+	_visible_mesh_nodes_cache.clear()
 	var root: Node = EditorInterface.get_edited_scene_root()
 	if root == null:
-		return {}
-	var mesh_nodes: Array[Node] = root.find_children("*", "MeshInstance3D", true, false)
+		_visible_mesh_cache_dirty = false
+		_visible_mesh_cache_elapsed = 0.0
+		return
 	if root is MeshInstance3D:
-		mesh_nodes.push_front(root)
+		_visible_mesh_nodes_cache.append(root as MeshInstance3D)
+	var found: Array[Node] = root.find_children("*", "MeshInstance3D", true, false)
+	for node in found:
+		if node is MeshInstance3D:
+			_visible_mesh_nodes_cache.append(node as MeshInstance3D)
+	_visible_mesh_cache_dirty = false
+	_visible_mesh_cache_elapsed = 0.0
+
+func _cached_mesh_surfaces(mesh: Mesh) -> Array:
+	var key: int = mesh.get_instance_id()
+	if _mesh_surface_cache.has(key):
+		return _mesh_surface_cache[key] as Array
+	var cached_surfaces: Array = []
+	for surface_index in mesh.get_surface_count():
+		var arrays: Array = mesh.surface_get_arrays(surface_index)
+		if arrays.is_empty():
+			continue
+		var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
+		if vertices.is_empty():
+			continue
+		cached_surfaces.append({"vertices": vertices, "indices": indices})
+	_mesh_surface_cache[key] = cached_surfaces
+	return cached_surfaces
+
+func _raycast_visible_meshes(origin: Vector3, ray_end: Vector3, ray_direction: Vector3) -> Dictionary:
+	if _visible_mesh_cache_dirty or _visible_mesh_cache_elapsed >= VISIBLE_MESH_CACHE_REFRESH_SECONDS:
+		_refresh_visible_mesh_cache()
 
 	var nearest_distance: float = INF
 	var nearest_hit: Dictionary = {}
-	for candidate in mesh_nodes:
-		var mesh_instance := candidate as MeshInstance3D
-		if mesh_instance == null or not mesh_instance.is_visible_in_tree() or mesh_instance.mesh == null:
+	for mesh_instance in _visible_mesh_nodes_cache:
+		if mesh_instance == null or not is_instance_valid(mesh_instance):
+			_visible_mesh_cache_dirty = true
+			continue
+		if not mesh_instance.is_visible_in_tree() or mesh_instance.mesh == null:
 			continue
 		if (mesh_instance.layers & collision_layer_mask) == 0:
 			continue
@@ -2099,18 +2367,21 @@ func _raycast_visible_meshes(origin: Vector3, ray_end: Vector3, ray_direction: V
 			continue
 		if not _surface_is_allowed(mesh_instance):
 			continue
+
 		var inverse: Transform3D = mesh_instance.global_transform.affine_inverse()
 		var local_origin: Vector3 = inverse * origin
 		var local_end: Vector3 = inverse * ray_end
 		var mesh: Mesh = mesh_instance.mesh
-		for surface_index in mesh.get_surface_count():
-			var arrays: Array = mesh.surface_get_arrays(surface_index)
-			if arrays.is_empty():
-				continue
-			var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-			var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
-			if vertices.is_empty():
-				continue
+		# Cheap broad-phase test. This skips triangle work for every mesh the ray
+		# cannot possibly touch, which matters greatly when painting across a scene.
+		if not mesh.get_aabb().intersects_segment(local_origin, local_end):
+			continue
+
+		var cached_surfaces: Array = _cached_mesh_surfaces(mesh)
+		for surface_data_variant in cached_surfaces:
+			var surface_data: Dictionary = surface_data_variant as Dictionary
+			var vertices: PackedVector3Array = surface_data["vertices"] as PackedVector3Array
+			var indices: PackedInt32Array = surface_data["indices"] as PackedInt32Array
 			var triangle_count: int = indices.size() / 3 if not indices.is_empty() else vertices.size() / 3
 			for triangle_index in triangle_count:
 				var base: int = triangle_index * 3
@@ -2166,33 +2437,13 @@ func _surface_is_allowed(surface_node: Node) -> bool:
 	return surface_node == selected_node or selected_node.is_ancestor_of(surface_node) or surface_node.is_ancestor_of(selected_node)
 
 func _basis_from_normal(normal: Vector3) -> Basis:
-	var up: Vector3 = normal.normalized()
-	var reference_axis: Vector3 = Vector3.FORWARD if absf(up.dot(Vector3.FORWARD)) < 0.99 else Vector3.RIGHT
-	var right: Vector3 = reference_axis.cross(up).normalized()
-	var forward: Vector3 = up.cross(right).normalized()
-	return Basis(right, up, -forward)
+	return PainterGeometry.basis_from_normal(normal)
 
 func _surface_right(normal: Vector3) -> Vector3:
-	var up: Vector3 = normal.normalized()
-	var reference_axis: Vector3 = Vector3.FORWARD if absf(up.dot(Vector3.FORWARD)) < 0.99 else Vector3.RIGHT
-	return reference_axis.cross(up).normalized()
-
-
-# ---------------------------------------------------------------------------
-# Statistics and asset analysis
-# ---------------------------------------------------------------------------
+	return PainterGeometry.surface_right(normal)
 
 func _analysis_collect_nodes(root: Node) -> Array[Node]:
-	var result: Array[Node] = []
-	if root == null:
-		return result
-	var stack: Array[Node] = [root]
-	while not stack.is_empty():
-		var node: Node = stack.pop_back()
-		result.append(node)
-		for child in node.get_children():
-			stack.append(child)
-	return result
+	return AssetAnalysis.collect_nodes(root)
 
 func get_environment_statistics() -> String:
 	var root := EditorInterface.get_edited_scene_root()
@@ -2234,57 +2485,8 @@ func get_environment_statistics() -> String:
 	return "Statistics & Analysis\nScene instances: %d\nMultiMeshes: %d\nMultiMesh instances: %d\nUnique assets: %d\nEstimated draw calls: %d\nEstimated triangles: %d\nOptimization rating: %s" % [scene_instances, multimeshes, multimesh_instances, unique_assets.size(), estimated_draw_calls, estimated_triangles, rating]
 
 func analyze_asset(scene_path: String) -> String:
-	if scene_path.is_empty() or not ResourceLoader.exists(scene_path):
-		return "Asset Analysis\nThe selected asset could not be loaded."
-	var packed := load(scene_path) as PackedScene
-	if packed == null:
-		return "Asset Analysis\nThe selected resource is not a valid PackedScene."
-	var instance := packed.instantiate()
-	if instance == null:
-		return "Asset Analysis\nThe selected scene could not be instantiated."
-	var mesh_count := 0
-	var material_count := 0
-	var triangle_count := 0
-	var collision_count := 0
-	var script_count := 0
-	var animation_count := 0
-	var particle_count := 0
-	var light_count := 0
-	for node in _analysis_collect_nodes(instance):
-		if node.get_script() != null:
-			script_count += 1
-		if node is MeshInstance3D:
-			var mesh_node := node as MeshInstance3D
-			if mesh_node.mesh != null:
-				mesh_count += 1
-				triangle_count += _analysis_mesh_triangle_count(mesh_node.mesh)
-				material_count += mesh_node.mesh.get_surface_count()
-			if mesh_node.material_override != null:
-				material_count += 1
-		elif node is CollisionShape3D or node is CollisionObject3D:
-			collision_count += 1
-		elif node is AnimationPlayer:
-			animation_count += 1
-		elif node is GPUParticles3D or node is CPUParticles3D:
-			particle_count += 1
-		elif node is Light3D:
-			light_count += 1
-	var compatible := mesh_count > 0
-	var recommended := "MultiMesh" if compatible and script_count == 0 and animation_count == 0 and particle_count == 0 and light_count == 0 else "Scene Instances"
-	instance.queue_free()
-	return "Asset Analysis: %s\nMeshes: %d\nEstimated triangles: %d\nMaterials/surfaces: %d\nCollision nodes: %d\nScripts: %d\nAnimationPlayers: %d\nParticle nodes: %d\nLights: %d\nMultiMesh compatible: %s\nRecommended mode: %s" % [scene_path.get_file(), mesh_count, triangle_count, material_count, collision_count, script_count, animation_count, particle_count, light_count, "Yes" if compatible else "No", recommended]
+	return AssetAnalysis.analyze_asset(scene_path)
 
 func _analysis_mesh_triangle_count(mesh: Mesh) -> int:
-	var triangles := 0
-	for surface in mesh.get_surface_count():
-		var arrays := mesh.surface_get_arrays(surface)
-		if arrays.is_empty():
-			continue
-		var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
-		if not indices.is_empty():
-			triangles += indices.size() / 3
-		else:
-			var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-			triangles += vertices.size() / 3
-	return triangles
+	return AssetAnalysis.mesh_triangle_count(mesh)
 
